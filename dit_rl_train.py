@@ -26,214 +26,18 @@ import gzip
 import warnings
 warnings.filterwarnings('ignore')
 
-# 설정 파라미터
-MAX_QUBITS = 16
-MAX_GATES = 100
-MAX_DEPTH = 30
-LATENT_DIM = 256
-NUM_HEADS = 8
-NUM_LAYERS = 6
-BATCH_SIZE = 32
-NUM_EPOCHS = 100
-LEARNING_RATE = 1e-4
-DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+from quantum_rl.constants import (
+    MAX_QUBITS, MAX_GATES, MAX_DEPTH, LATENT_DIM, NUM_HEADS, NUM_LAYERS,
+    DEVICE, SAMPLING_BATCH_SIZE, OBS_DIM, ACTION_DIM, 
+    RL_BATCH_SIZE, RL_EPOCHS, LEARNING_RATE, GAMMA, GAE_LAMBDA, CLIP_EPSILON,
+    ENTROPY_COEF, CRITIC_COEF, MAX_GRAD_NORM, NUM_TIMESTEPS,
+    PREDICTOR_MODEL_PATH, DIFFUSION_MODEL_PATH, RL_AGENT_MODEL_PATH, GATE_MAPPING
+)
+from quantum_rl.agent import PPOAgent
+from quantum_rl.predictor import CircuitPredictor
 
 print(f"🚀 DiT + RL 양자 회로 최적화 시스템 초기화")
 print(f"디바이스: {DEVICE}")
-
-#################################################
-# 0. 예측기 모델 클래스 정의
-#################################################
-
-from advanced_quantum_transformer import QuantumRepresentationTransformer as AdvancedTransformer
-
-class CircuitPredictor:
-    """양자 회로 성능 예측기"""
-    
-    def __init__(self, model_path: str = None):
-        """
-        Args:
-            model_path: 훈련된 예측기 모델 경로
-        """
-        self.model = AdvancedTransformer().to(DEVICE)
-        
-        if model_path and os.path.exists(model_path):
-            try:
-                self.model.load_state_dict(torch.load(model_path, map_location=DEVICE))
-                print(f"✅ 예측기 모델 로드 완료: {model_path}")
-            except Exception as e:
-                print(f"⚠️ 예측기 모델 로드 실패: {e}")
-                print("🔄 랜덤 초기화된 모델 사용")
-        else:
-            print("🔄 예측기 모델 경로가 없어 랜덤 초기화된 모델 사용")
-        
-        self.model.eval()
-    
-    def circuit_to_features(self, circuit):
-        """
-        🎯 Qiskit 회로를 예측기 입력 형태로 변환
-        
-        Returns:
-            dict: 예측기 입력 데이터
-                - gate_sequence: [100] 게이트 타입 시퀀스 (0~8)
-                - qubit_sequence: [100] 큐빗 인덱스 시퀀스
-                - param_sequence: [100] 파라미터 시퀀스
-                - gate_type_sequence: [100] 게이트 분류 시퀀스 (0,1,2)
-                - features: [33] 회로 특성 벡터
-        """
-        # 게이트 매핑
-        gate_mapping = {
-            'h': 1, 'x': 2, 'y': 3, 'z': 4, 's': 5, 't': 6,
-            'rx': 7, 'ry': 8, 'rz': 8, 'cx': 8, 'cz': 8
-        }
-        
-        # 시퀀스 초기화 (최대 길이 100)
-        max_len = 100
-        gate_sequence = [0] * max_len
-        qubit_sequence = [-1] * max_len
-        param_sequence = [0.0] * max_len
-        gate_type_sequence = [0] * max_len
-        
-        # 회로에서 게이트 정보 추출
-        gate_count = 0
-        cnot_count = 0
-        param_count = 0
-        param_values = []
-        
-        for i, instruction in enumerate(circuit.data):
-            if i >= max_len:
-                break
-                
-            gate_name = instruction.operation.name.lower()
-            qubits = [circuit.find_bit(qubit).index for qubit in instruction.qubits]
-            params = instruction.operation.params
-            
-            # 게이트 타입 매핑
-            gate_id = gate_mapping.get(gate_name, 0)
-            gate_sequence[i] = gate_id
-            
-            # 큐비트 정보 (첫 번째 큐비트만 사용)
-            if qubits:
-                qubit_sequence[i] = qubits[0]
-            
-            # 파라미터 정보
-            if params:
-                param_value = float(params[0]) if params[0] is not None else 0.0
-                param_sequence[i] = param_value
-                param_values.append(param_value)
-                param_count += 1
-            
-            # 게이트 타입 분류
-            if gate_name in ['cx', 'cz']:
-                gate_type_sequence[i] = 2  # 2큐빗 게이트
-                cnot_count += 1
-            elif gate_name in ['rx', 'ry', 'rz']:
-                gate_type_sequence[i] = 1  # 파라미터 게이트
-            else:
-                gate_type_sequence[i] = 0  # 기본 게이트
-            
-            gate_count += 1
-        
-        # 🎯 회로 특성 계산 (33차원 벡터)
-        n_qubits = circuit.num_qubits
-        depth = circuit.depth()
-        
-        # 파라미터 통계
-        param_mean = np.mean(param_values) if param_values else 0.0
-        param_std = np.std(param_values) if param_values else 0.0
-        param_min = min(param_values) if param_values else 0.0
-        param_max = max(param_values) if param_values else 0.0
-        
-        # 정규화된 특성 벡터 생성 (33차원)
-        features = [
-            # 🔧 구조적 특성 (7개)
-            n_qubits / 127.0,                              # 큐빗 수 정규화
-            depth / 10.0,                                   # 깊이 정규화
-            gate_count / 200.0,                             # 게이트 수 정규화
-            cnot_count / 100.0,                             # CNOT 수 정규화
-            (gate_count - cnot_count) / 150.0,              # 단일 큐빗 게이트 수
-            len(set(gate_sequence[:gate_count])) / 8.0,     # 고유 게이트 타입 수
-            cnot_count / 50.0,                              # CNOT 연결 수
-            
-            # 🔗 커플링 특성 (6개) - 기본값 (실제로는 회로 분석 필요)
-            0.5,  # coupling_density
-            0.3,  # max_degree / 10.0
-            0.2,  # avg_degree / 5.0
-            0.4,  # connectivity_ratio
-            0.6,  # diameter / 20.0
-            0.1,  # clustering_coefficient
-            
-            # 📊 파라미터 특성 (5개)
-            param_count / 50.0,                             # 파라미터 개수
-            param_mean / (2 * np.pi),                       # 파라미터 평균
-            param_std / np.pi,                              # 파라미터 표준편차
-            param_min / (2 * np.pi),                        # 파라미터 최솟값
-            param_max / (2 * np.pi),                        # 파라미터 최댓값
-            
-            # 📈 측정 통계 특성 (7개) - 기본값 (실제로는 시뮬레이션 필요)
-            0.5,  # entropy / 20.0
-            0.1,  # zero_state_probability
-            0.3,  # concentration
-            0.2,  # measured_states / 1000.0
-            0.4,  # top_1_probability
-            0.6,  # top_5_probability
-            0.7,  # top_10_probability
-            
-            # 🔄 시퀀스 특성 (4개)
-            gate_count / max_len,                           # 시퀀스 길이 비율
-            len(set(gate_sequence[:gate_count])) / 8.0,     # 고유 게이트 비율
-            param_count / gate_count if gate_count > 0 else 0.0,  # 파라미터 게이트 비율
-            cnot_count / gate_count if gate_count > 0 else 0.0,   # 2큐빗 게이트 비율
-            
-            # ⚙️ 하드웨어 특성 (4개) - 기본값
-            1.0,  # gate_overhead
-            1.0,  # depth_overhead
-            0.5,  # transpiled_depth / 50.0
-            0.3   # transpiled_gate_count / 500.0
-        ]
-        
-        return {
-            'gate_sequence': gate_sequence,
-            'qubit_sequence': qubit_sequence,
-            'param_sequence': param_sequence,
-            'gate_type_sequence': gate_type_sequence,
-            'features': features
-        }
-    
-    def predict(self, circuit):
-        """
-        회로 성능 예측
-        
-        Args:
-            circuit: Qiskit QuantumCircuit 객체
-            
-        Returns:
-            dict: 예측 결과
-                - fidelity: 피델리티 (0~1)
-                - normalized_expressibility: 정규화된 표현력 (0~1)
-                - expressibility_distance: 표현력 거리
-        """
-        with torch.no_grad():
-            # 회로를 입력 형태로 변환
-            circuit_data = self.circuit_to_features(circuit)
-            
-            # 텐서로 변환
-            gate_seq = torch.LongTensor(circuit_data['gate_sequence']).unsqueeze(0).to(DEVICE)
-            qubit_seq = torch.LongTensor(circuit_data['qubit_sequence']).unsqueeze(0).to(DEVICE)
-            param_seq = torch.FloatTensor(circuit_data['param_sequence']).unsqueeze(0).to(DEVICE)
-            gate_type_seq = torch.LongTensor(circuit_data['gate_type_sequence']).unsqueeze(0).to(DEVICE)
-            features = torch.FloatTensor(circuit_data['features']).unsqueeze(0).to(DEVICE)
-            
-            # 예측 수행
-            _, preds, _ = self.model(gate_seq, qubit_seq, param_seq, gate_type_seq, features, return_predictions=True)
-            
-            # 결과 반환 (시그모이드로 0~1 범위 정규화)
-            return {
-                'fidelity': torch.sigmoid(preds[0, 0]).item(),
-                'normalized_expressibility': torch.sigmoid(preds[0, 1]).item(),
-                'expressibility_distance': torch.abs(preds[0, 2]).item() * 1e-3,
-            }
-
 class QuantumCircuitDataset(Dataset):
     def __init__(self, data_dir, transform=None):
         """
@@ -544,6 +348,60 @@ class QuantumCircuitDiffusion:
         final_circuit = self._convert_to_circuit(x.cpu().numpy()[0], n_qubits)
         return final_circuit
     
+    @torch.no_grad()
+    def sample_batch(self, n_qubits, seq_len, batch_size=SAMPLING_BATCH_SIZE, device=DEVICE):
+        """병렬 batch 디퓨전 샘플링: 여러 회로 리스트 반환"""
+        x = torch.randn(batch_size, seq_len, 3 + MAX_QUBITS, device=device)
+        for t in tqdm(reversed(range(self.num_timesteps)), desc="Batch Sampling"):
+            timestep = torch.full((batch_size,), t, device=device, dtype=torch.long)
+            
+            # 노이즈 예측
+            gate_logits, qubit_logits, param_preds = self.model(x, timestep)
+            
+            # 노이즈 제거 및 다음 샘플 생성
+            alpha = self.alphas[t]
+            alpha_cumprod = self.alphas_cumprod[t]
+            beta = self.betas[t]
+            
+            # 게이트 타입 샘플링 (카테고리컬)
+            gate_probs = F.softmax(gate_logits, dim=-1)
+            gate_indices = torch.multinomial(gate_probs.view(-1, gate_probs.size(-1)), 1).view(batch_size, seq_len)
+            
+            # 큐비트 인덱스 샘플링 (상위 n_qubits 개만 선택)
+            qubit_probs = F.softmax(qubit_logits, dim=-1)
+            qubit_indices = torch.zeros(batch_size, seq_len, MAX_QUBITS, device=device)
+            for b_idx in range(batch_size):
+                for i in range(seq_len):
+                    idx = gate_indices[b_idx, i].item()
+                    if idx in [9, 10, 11]:
+                        top_q = torch.topk(qubit_probs[b_idx, i], 2).indices
+                        qubit_indices[b_idx, i, top_q] = 1.0
+                    elif idx == 12:
+                        top_q = torch.topk(qubit_probs[b_idx, i], 3).indices
+                        qubit_indices[b_idx, i, top_q] = 1.0
+                    else:
+                        top_q = torch.topk(qubit_probs[b_idx, i], 1).indices
+                        qubit_indices[b_idx, i, top_q] = 1.0
+            
+            # 파라미터 그대로 사용 (연속적 값)
+            params = param_preds
+            
+            # 새로운 x 생성
+            new_x = torch.zeros_like(x)
+            new_x[:, :, 0] = gate_indices.float()
+            new_x[:, :, 1:1+MAX_QUBITS] = qubit_indices
+            new_x[:, :, 1+MAX_QUBITS:1+MAX_QUBITS+2] = params
+            
+            if t > 0:
+                noise = torch.randn_like(x)
+                x = (1 / torch.sqrt(alpha)) * (new_x - ((1 - alpha) / torch.sqrt(1 - alpha_cumprod)) * noise) + torch.sqrt(beta) * noise
+            else:
+                x = new_x
+        
+        # 회로 변환
+        x_np = x.cpu().numpy()
+        return [self._convert_to_circuit(x_np[i], n_qubits) for i in range(batch_size)]
+    
     def _convert_to_circuit(self, gate_sequence, n_qubits):
         """생성된 게이트 시퀀스를 실제 양자 회로로 변환"""
         circuit = QuantumCircuit(n_qubits)
@@ -736,11 +594,14 @@ class QuantumCircuitEnv(gym.Env):
         try:
             # 디퓨전 모델로 회로 생성 시도 (seq_len clamped)
             seq_len_to_sample = max(1, min(int(self.max_gates * gate_density), self.max_gates))
-            # sample() already returns a Qiskit QuantumCircuit
-            circuit = self.diffusion_model.sample(
-                n_qubits=self.n_qubits,
-                seq_len=seq_len_to_sample
+            # batch 샘플링 후 보상 기준 최적 회로 선택
+            circuits = self.diffusion_model.sample_batch(
+                self.n_qubits, seq_len_to_sample, batch_size=SAMPLING_BATCH_SIZE
             )
+            metrics_list = [self._evaluate_circuit_with_predictor(c) for c in circuits]
+            rewards = [self._compute_reward(m) for m in metrics_list]
+            best_idx = int(np.argmax(rewards))
+            circuit = circuits[best_idx]
         except Exception as e:
             print(f"⚠️ 디퓨전 모델 생성 실패: {e}")
             # 폴백: 파라미터 기반 랜덤 회로 생성
@@ -915,151 +776,7 @@ import torch.cuda.amp as amp
 import torch.nn.utils as nn_utils
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 
-class PPOAgent:
-    """Proximal Policy Optimization (PPO) 에이전트"""
-    
-    def __init__(self, obs_dim, act_dim, hidden_dim=64):
-        # 액터 네트워크 (정책)
-        self.actor = nn.Sequential(
-            nn.Linear(obs_dim, hidden_dim),
-            nn.Tanh(),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.Tanh(),
-            nn.Linear(hidden_dim, act_dim * 2)  # 평균과 로그 표준편차
-        )
-        self.actor = self.actor.to(DEVICE)
-        
-        # 크리틱 네트워크 (가치 함수)
-        self.critic = nn.Sequential(
-            nn.Linear(obs_dim, hidden_dim),
-            nn.Tanh(),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.Tanh(),
-            nn.Linear(hidden_dim, 1)
-        )
-        self.critic = self.critic.to(DEVICE)
-        
-        self.optimizer = torch.optim.Adam(
-            list(self.actor.parameters()) + list(self.critic.parameters()),
-            lr=3e-4
-        )
-        
-        self.act_dim = act_dim
-        
-        # Mixed-precision scaler
-        self.scaler = amp.GradScaler()
-        
-        # LR scheduler: reduce LR on plateau based on episode reward
-        self.scheduler = ReduceLROnPlateau(self.optimizer, mode='max', factor=0.9, patience=10, verbose=True)
-    
-    def get_action(self, obs, deterministic=False):
-        """정책에서 액션 샘플링"""
-        with torch.no_grad():
-            device = next(self.actor.parameters()).device
-            # obs를 텐서로 변환하고 올바른 장치로 이동, 배치 차원 추가
-            obs_tensor = torch.as_tensor(obs, dtype=torch.float32, device=device)
-            if obs_tensor.dim() == 1:
-                obs_tensor = obs_tensor.unsqueeze(0)
-            out = self.actor(obs_tensor)
-            # 배치 차원 처리
-            mean, log_std = out[:, :self.act_dim], out[:, self.act_dim:]
-        
-        log_std = torch.clamp(log_std, -20, 2)
-        std = torch.exp(log_std)
-        
-        if deterministic:
-            action = mean
-        else:
-            action = mean + std * torch.randn_like(std)
-        
-        # 액션 범위 제한
-        action = torch.clamp(action, 0.1, 2.0)
-        
-        # 배치 차원 제거 후 반환
-        return action.squeeze(0).cpu().numpy()
-    
-    def get_value(self, obs):
-        """가치 함수에서 상태 가치 계산"""
-        with torch.no_grad():
-            device = next(self.critic.parameters()).device
-            obs = torch.FloatTensor(obs).to(device)
-            value = self.critic(obs)
-            return value.item()
-    
-    def update(self, rollouts, clip_param=0.2, epochs=10):
-        """PPO 업데이트"""
-        # 롤아웃 데이터 처리
-        device = next(self.actor.parameters()).device
-        obs = torch.FloatTensor(rollouts["obs"]).to(device)
-        actions = torch.FloatTensor(rollouts["actions"]).to(device)
-        rewards = torch.FloatTensor(rollouts["rewards"]).to(device)
-        values = torch.FloatTensor(rollouts["values"]).to(device)
-        returns = torch.FloatTensor(rollouts["returns"]).to(device)
-        old_log_probs = torch.FloatTensor(rollouts["log_probs"]).to(device)
-        
-        # 여러 에포크 동안 훈련
-        for _ in range(epochs):
-            # Mixed-precision forward
-            with amp.autocast():
-                # 현재 정책에서의 액션 로그 확률 계산
-                out = self.actor(obs)
-                mean, log_std = out[:, :self.act_dim], out[:, self.act_dim:]
-                log_std = torch.clamp(log_std, -20, 2)
-                std = torch.exp(log_std)
-                
-                # 가우시안 분포 로그 확률
-                dist = torch.distributions.Normal(mean, std)
-                curr_log_probs = dist.log_prob(actions).sum(dim=1)
-                
-                # 현재 가치 추정
-                curr_values = self.critic(obs).squeeze()
-                
-                # 비율 계산
-                ratio = torch.exp(curr_log_probs - old_log_probs)
-                
-                # 클립된 서라운드 목적 함수
-                clip_adv = torch.clamp(ratio, 1-clip_param, 1+clip_param) * (returns - values)
-                surr1 = ratio * (returns - values)
-                surr2 = clip_adv
-                policy_loss = -torch.min(surr1, surr2).mean()
-                
-                # 가치 함수 손실
-                value_loss = F.mse_loss(curr_values, returns)
-                
-                # 전체 손실 및 업데이트
-                loss = policy_loss + 0.5 * value_loss
-            
-            # Scaled backward pass
-            self.scaler.scale(loss).backward()
-            # Unscale and clip gradients
-            self.scaler.unscale_(self.optimizer)
-            nn_utils.clip_grad_norm_(list(self.actor.parameters()) + list(self.critic.parameters()), max_norm=0.5)
-            # Optimizer step
-            self.scaler.step(self.optimizer)
-            self.scaler.update()
-        
-        # 롤아웃 데이터 변환
-        for key in rollouts:
-            if rollouts[key]:  # 빈 리스트가 아닌 경우만
-                rollouts[key] = np.array(rollouts[key])
-            else:
-                rollouts[key] = np.array([])
-        
-        # 보상으로부터 리턴 계산
-        if len(rollouts["rewards"]) > 0:
-            returns = []
-            R = 0
-            for r in reversed(rollouts["rewards"]):
-                R = r + 0.99 * R  # 감마 = 0.99
-                returns.insert(0, R)
-            rollouts["returns"] = np.array(returns)
-            
-            # 로그 확률 계산 (간단한 근사)
-            rollouts["log_probs"] = np.zeros_like(rollouts["rewards"])
-            
-            # 에이전트 업데이트
-            if len(rollouts["obs"]) > 0:
-                self.update(rollouts)
+
 
 def train_rl_agent(diffusion_model, predictor_model_path=None, n_episodes=1000):
     """PPO 에이전트 훈련 (예측기 모델 사용)"""
@@ -1097,15 +814,16 @@ def train_rl_agent(diffusion_model, predictor_model_path=None, n_episodes=1000):
         
         while not done and step_count < env.max_steps:
             # 액션 선택
-            action = agent.get_action(obs)
+            action_from_agent, log_prob = agent.get_action(obs) # 에이전트로부터 액션과 로그 확률을 받음
             value = agent.get_value(obs)
             
             # 환경 진행
-            next_obs, reward, done, _, step_info = env.step(action)
+            next_obs, reward, done, _, step_info = env.step(action_from_agent) # 실제 액션(numpy array)만 전달
             
             # 데이터 저장
             rollouts["obs"].append(obs)
-            rollouts["actions"].append(action)
+            rollouts["actions"].append(action_from_agent) # 실제 액션 저장
+            rollouts["log_probs"].append(log_prob) # 로그 확률 저장 (PPO 업데이트에 필요)
             rollouts["rewards"].append(reward)
             rollouts["values"].append(value)
             
